@@ -637,6 +637,9 @@ class BuildFreeBSDBase(Project):
         super().setup()
         self._setup_core_make_args()
 
+        if not self.warnings_as_errors:
+            self.make_args.set(WITHOUT_WERROR="1")
+
         if self.crossbuild:
             # Use the script that I added for building on Linux/MacOS:
             self.make_args.set_command(
@@ -1127,12 +1130,18 @@ class BuildFreeBSD(BuildFreeBSDBase):
         xccinfo = self.get_compiler_info(self.CC)
         if not xccinfo.is_clang:
             self.ask_for_confirmation("Cross compiler is not clang, are you sure you want to continue?")
-        self.cross_toolchain_config.set_env(
+
+        env = dict(
             XCC=self.CC,
             XCXX=self.CXX,
             XCPP=self.CPP,
             X_COMPILER_TYPE=xccinfo.compiler,  # This is needed otherwise the build assumes it should build with $CC
         )
+        if self.cflags:
+            env["XCFLAGS"] = self.commandline_to_str(self.cflags)
+        if self.cxxflags:
+            env["XCXXFLAGS"] = self.commandline_to_str(self.cxxflags)
+        self.cross_toolchain_config.set_env(**env)
         if self.bootstrap_llvm_binutils:
             self.cross_toolchain_config.set_with_options(LLVM_BINUTILS_BOOTSTRAP=True)
         else:
@@ -1604,11 +1613,45 @@ class BuildFreeBSD(BuildFreeBSDBase):
         if is_jenkins_build():
             self._copykernel(kernconfs=kernconfs, rootfs_dir=self.install_dir, dest_dir=self.config.output_root)
 
+    def _get_compiler_with_flags(self, name: str, compiler: str, flags: "list[str]") -> str:
+        if not flags and self.warnings_as_errors:
+            return str(compiler)
+
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = self.build_dir / f"{name}-wrapper.sh"
+
+        import shlex
+
+        script = [
+            "#!/bin/sh",
+            "for arg do",
+            '    case "$arg" in',
+        ]
+        if not self.warnings_as_errors:
+            script += [
+                '        -Werror*) ;;',
+            ]
+        script += [
+            '        *) set -- "$@" "$arg" ;;',
+            '    esac',
+            '    shift',
+            'done',
+            f'exec {shlex.quote(str(compiler))} "$@" ' + " ".join(shlex.quote(f) for f in flags),
+        ]
+
+        wrapper.write_text("\n".join(script) + "\n")
+        wrapper.chmod(0o755)
+        return str(wrapper)
+
     def add_cross_build_options(self) -> None:
         assert self.crossbuild
+
+        cc = self._get_compiler_with_flags("host-cc", str(self.host_CC), self.cflags)
+        cxx = self._get_compiler_with_flags("host-cxx", str(self.host_CXX), self.cxxflags)
+
         self.make_args.set_env(
-            CC=self.host_CC,
-            CXX=self.host_CXX,
+            CC=cc,
+            CXX=cxx,
             CPP=self.host_CPP,
             STRIPBIN=shutil.which("strip") or shutil.which("llvm-strip") or "strip",
         )
@@ -1617,6 +1660,10 @@ class BuildFreeBSD(BuildFreeBSDBase):
             # We have to provide the default X* values so that Makefile.inc1 does not disable MK_CLANG_BOOTSTRAP and
             # doesn't try to use the host toolchain for cross-building
             self.make_args.set_env(XCC="cc", XCXX="c++", XCPP="cpp", XSTRIPBIN="strip")
+            if self.cflags:
+                self.make_args.set_env(XCFLAGS=self.commandline_to_str(self.cflags))
+            if self.cxxflags:
+                self.make_args.set_env(XCXXFLAGS=self.commandline_to_str(self.cxxflags))
             # We also have to set X_COMPILER_TYPE since the build system is broken and determines it before it's built
             # the bootstrap toolchain, so will fall back on the inferred value for COMPILER_TYPE, which is likely gcc
             # on Linux.
